@@ -5,7 +5,7 @@ import sys
 import datetime
 import pymysql
 from pymysqlreplication import BinLogStreamReader
-from pymysqlreplication.event import QueryEvent, RotateEvent, FormatDescriptionEvent
+from pymysqlreplication.event import QueryEvent, RotateEvent, FormatDescriptionEvent, GtidEvent, XidEvent
 from binlog2sql_util import command_line_args, concat_sql_from_binlog_event, create_unique_file, temp_open, \
     reversed_lines, is_dml_event, event_type
 
@@ -70,6 +70,11 @@ class Binlog2sql(object):
         e_start_pos, last_pos = stream.log_pos, stream.log_pos
         # to simplify code, we do not use flock for tmp_file.
         tmp_file = create_unique_file('%s.%s' % (self.conn_setting['host'], self.conn_setting['port']))
+        
+        current_gtid = None
+        current_xid = None
+        transaction_sqls = [] 
+        
         with temp_open(tmp_file, "w") as f_tmp, self.connection as cursor:
             for binlog_event in stream:
                 if not self.stop_never:
@@ -90,29 +95,114 @@ class Binlog2sql(object):
                             (stream.log_file == self.eof_file and stream.log_pos > self.eof_pos) or \
                             (event_time >= self.stop_time):
                         break
-                    # else:
-                    #     raise ValueError('unknown binlog file or position')
+
+                if isinstance(binlog_event, GtidEvent):
+                    current_gtid = binlog_event.gtid
+                    transaction_sqls = []
+                    e_start_pos = last_pos
 
                 if isinstance(binlog_event, QueryEvent) and binlog_event.query == 'BEGIN':
                     e_start_pos = last_pos
+                    transaction_sqls = []
+
+                if isinstance(binlog_event, XidEvent):
+                    current_xid = binlog_event.xid
+                  
+                    for sql in transaction_sqls:
+                        # 修改部分：直接将GTID和XID信息附加到SQL语句末尾
+                        additional_info = ""
+                        if current_gtid:
+                            additional_info += " GTID:{}".format(current_gtid)
+                        if current_xid:
+                            additional_info += " XID:{}".format(current_xid)
+                        
+                        if additional_info:
+                            # 去除原有的/* */注释，直接附加信息
+                            if "/*" in sql and "*/" in sql:
+                                comment_start = sql.rfind("/*")
+                                comment_end = sql.rfind("*/")
+                                if comment_start != -1 and comment_end != -1:
+                                    # 保留原有注释内容但不包含/* */
+                                    original_comment = sql[comment_start+2:comment_end].strip()
+                                    new_comment = original_comment + additional_info
+                                    final_sql = sql[:comment_start] + new_comment + sql[comment_end+2:]
+                                else:
+                                    final_sql = sql.strip() + additional_info
+                            else:
+                                final_sql = sql.strip() + additional_info
+                        else:
+                            final_sql = sql
+                        
+                        if self.flashback:
+                            f_tmp.write(final_sql + '\n')
+                        else:
+                            print(final_sql)
+                    
+                    transaction_sqls = []
+                    current_gtid = None
+                    current_xid = None
 
                 if isinstance(binlog_event, QueryEvent) and not self.only_dml:
                     sql = concat_sql_from_binlog_event(cursor=cursor, binlog_event=binlog_event,
                                                        flashback=self.flashback, no_pk=self.no_pk)
                     if sql:
+                        # 修改部分：直接将GTID和XID信息附加到SQL语句末尾
+                        additional_info = ""
+                        if current_gtid:
+                            additional_info += " GTID:{}".format(current_gtid)
+                        if current_xid:
+                            additional_info += " XID:{}".format(current_xid)
+                        
+                        if additional_info:
+                            if "/*" in sql and "*/" in sql:
+                                comment_start = sql.rfind("/*")
+                                comment_end = sql.rfind("*/")
+                                if comment_start != -1 and comment_end != -1:
+                                    original_comment = sql[comment_start+2:comment_end].strip()
+                                    new_comment = original_comment + additional_info
+                                    sql = sql[:comment_start] + new_comment + sql[comment_end+2:]
+                                else:
+                                    sql = sql.strip() + additional_info
+                            else:
+                                sql = sql.strip() + additional_info
                         print(sql)
                 elif is_dml_event(binlog_event) and event_type(binlog_event) in self.sql_type:
                     for row in binlog_event.rows:
                         sql = concat_sql_from_binlog_event(cursor=cursor, binlog_event=binlog_event, no_pk=self.no_pk,
                                                            row=row, flashback=self.flashback, e_start_pos=e_start_pos)
-                        if self.flashback:
-                            f_tmp.write(sql + '\n')
-                        else:
-                            print(sql)
+                        if sql:
+                            transaction_sqls.append(sql)
 
                 if not (isinstance(binlog_event, RotateEvent) or isinstance(binlog_event, FormatDescriptionEvent)):
                     last_pos = binlog_event.packet.log_pos
                 if flag_last_event:
+                    for sql in transaction_sqls:
+                        # 修改部分：直接将GTID和XID信息附加到SQL语句末尾
+                        additional_info = ""
+                        if current_gtid:
+                            additional_info += " GTID:{}".format(current_gtid)
+                        if current_xid:
+                            additional_info += " XID:{}".format(current_xid)
+                        
+                        if additional_info:
+                            if "/*" in sql and "*/" in sql:
+                                comment_start = sql.rfind("/*")
+                                comment_end = sql.rfind("*/")
+                                if comment_start != -1 and comment_end != -1:
+                                    original_comment = sql[comment_start+2:comment_end].strip()
+                                    new_comment = original_comment + additional_info
+                                    final_sql = sql[:comment_start] + new_comment + sql[comment_end+2:]
+                                else:
+                                    final_sql = sql.strip() + additional_info
+                            else:
+                                final_sql = sql.strip() + additional_info
+                        else:
+                            final_sql = sql
+                        
+                        if self.flashback:
+                            f_tmp.write(final_sql + '\n')
+                        else:
+                            print(final_sql)
                     break
 
             stream.close()
